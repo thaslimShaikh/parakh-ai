@@ -1,4 +1,6 @@
-artifacts/
+artifacts/*.npy
+artifacts/*.pkl
+artifacts/features.jsonl
+data/
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
