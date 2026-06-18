@@ -1,11 +1,13 @@
 """
 rank.py — Parakh AI
-THE TIMED STEP: must complete in ≤5 minutes on CPU, 16GB RAM, no network.
+THE TIMED STEP: must complete in <=5 minutes on CPU, 16GB RAM, no network.
 
-Loads pre-computed artifacts (embeddings + structured features),
-fuses semantic similarity with structured signals,
-suppresses honeypots and keyword-stuffers,
-outputs a top-100 ranked CSV.
+Two-stage ranking:
+  Stage 1 — Structured signal scoring (title gating, career quality,
+             skill trust, experience, location, behavioral modifier)
+  Stage 2 — Semantic fusion (if embeddings available from precompute.py)
+
+Outputs a top-100 ranked CSV with per-candidate reasoning strings.
 
 Usage:
     python rank.py --candidates ./candidates.jsonl --out ./submission.csv
@@ -14,7 +16,6 @@ Usage:
 
 import argparse
 import json
-import os
 import sys
 import time
 from datetime import date, datetime
@@ -23,100 +24,115 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-from features import compute_features, final_score, WEIGHTS
+from features import compute_features, final_score
 
 TODAY = date.today()
 
-ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
+# ---------------------------------------------------------------------------
+# Fusion weights — tuned via sensitivity analysis
+# 0.80 structured / 0.20 semantic gives best stability:
+#   - structured features are JD-derived and highly reliable
+#   - semantic adds signal for "plain language" hidden gems
+#   - going higher on semantic risks promoting keyword-stuffers
+#     whose text superficially resembles the JD
+# ---------------------------------------------------------------------------
+STRUCT_W = 0.80
+SEM_W    = 0.20
 
 
 # ---------------------------------------------------------------------------
-# Reasoning string generation
+# Reasoning string generator
 # ---------------------------------------------------------------------------
 
 def days_since(date_str: str) -> int:
     try:
-        d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        return (TODAY - d).days
+        return (TODAY - datetime.strptime(date_str, "%Y-%m-%d").date()).days
     except Exception:
         return 999
 
 
 def generate_reasoning(feat: dict, rank: int) -> str:
     """
-    Generate a specific, honest reasoning string for Stage 4 manual review.
-    Varies sentence structure per candidate — no template substitution.
-    Mentions only things actually in the profile.
+    Fact-specific reasoning per candidate.
+    Varies sentence structure — never a template with name substituted in.
+    Only states things that are actually in the profile.
     """
-    yoe = feat["yoe"]
-    title = feat["title"]
-    loc = feat["location"]
+    yoe      = feat["yoe"]
+    title    = feat["title"]
+    loc      = feat["location"]
     response = feat["response_rate"]
-    notice = feat["notice_days"]
-    github = feat["github_score"]
-    inactive_days = days_since(feat["last_active"])
-    open_flag = feat["open_to_work"]
+    notice   = feat["notice_days"]
+    github   = feat["github_score"]
+    inactive = days_since(feat["last_active"])
+    open_flg = feat["open_to_work"]
 
     parts = []
 
-    # Title + experience (always)
+    # --- Title + experience ---
     if feat["title_score"] >= 0.9:
-        parts.append(f"{title} with {yoe:.1f} years directly matching the Senior AI Engineer profile")
+        parts.append(f"{title} with {yoe:.1f} yrs — direct title match for Senior AI Engineer")
     elif feat["title_score"] >= 0.6:
-        parts.append(f"{title} ({yoe:.1f} yrs) — adjacent role with strong transferable signals")
+        parts.append(f"{title} ({yoe:.1f} yrs) — adjacent role, strong transferable signals")
     else:
-        parts.append(f"{title} ({yoe:.1f} yrs)")
+        parts.append(f"{title} ({yoe:.1f} yrs) — non-standard title, ranked on career evidence")
 
-    # Career quality
-    if feat["career_score"] >= 0.75:
-        parts.append("career history shows retrieval/ranking/recsys work at product companies")
-    elif feat["career_score"] >= 0.5:
-        parts.append("some product-company exposure with relevant ML infrastructure work")
-    elif feat["career_score"] < 0.3:
-        parts.append("primarily consulting background — partial fit on the product-company criterion")
+    # --- Career quality ---
+    if feat["career_score"] >= 0.80:
+        parts.append("career shows deep retrieval/ranking/recsys work at product company")
+    elif feat["career_score"] >= 0.55:
+        parts.append("product-company background with ML infrastructure work")
+    elif feat["career_score"] >= 0.35:
+        parts.append("mixed consulting/product background")
+    else:
+        parts.append("primarily consulting background — partial fit on product-company criterion")
 
-    # Skill match
-    if feat["skill_score"] >= 0.6:
+    # --- Skill match ---
+    if feat["skill_score"] >= 0.65:
         parts.append("strong skill alignment with JD core stack (embeddings, retrieval, ranking)")
-    elif feat["skill_score"] >= 0.35:
+    elif feat["skill_score"] >= 0.40:
         parts.append("partial skill overlap with JD requirements")
+    else:
+        parts.append("limited direct skill overlap with JD core stack")
 
-    # Location
-    if feat["location_score"] >= 0.9:
-        parts.append(f"based in {loc} (preferred location)")
-    elif feat["location_score"] >= 0.7:
-        parts.append(f"India-based ({loc}), willing to relocate")
+    # --- Location ---
+    if feat["location_score"] >= 0.90:
+        parts.append(f"based in {loc} (JD preferred location)")
+    elif feat["location_score"] >= 0.70:
+        parts.append(f"India-based in {loc}, willing to relocate")
+    elif feat["location_score"] >= 0.50:
+        parts.append(f"India-based in {loc}")
+    else:
+        parts.append(f"located {loc} — outside preferred geography")
 
-    # Behavioral signals
-    if inactive_days <= 14:
-        parts.append(f"active in last {inactive_days}d")
-    elif inactive_days <= 30:
-        parts.append("recently active on platform")
-    elif inactive_days > 180:
-        parts.append(f"inactive for {inactive_days} days — availability risk")
+    # --- Behavioral signals ---
+    if inactive <= 7:
+        parts.append("active on platform within last 7 days")
+    elif inactive <= 30:
+        parts.append(f"recently active ({inactive}d ago)")
+    elif inactive > 180:
+        parts.append(f"platform inactive {inactive}d — availability risk")
 
     if response >= 0.75:
         parts.append(f"high recruiter response rate ({response:.0%})")
     elif response < 0.25:
-        parts.append(f"low response rate ({response:.0%}) — contact risk")
+        parts.append(f"low recruiter response rate ({response:.0%}) — contact risk")
 
     if notice <= 30:
-        parts.append(f"notice period {notice}d (immediate/near-immediate)")
+        parts.append(f"available within {notice}d notice")
     elif notice > 90:
         parts.append(f"notice period {notice}d — longer than preferred")
 
     if github >= 60:
-        parts.append(f"strong GitHub activity ({github:.0f}/100)")
+        parts.append(f"strong public GitHub activity ({github:.0f}/100)")
     elif github == -1:
-        parts.append("no GitHub linked")
+        parts.append("no GitHub profile linked")
 
-    if not open_flag:
-        parts.append("not marked open-to-work")
+    if not open_flg:
+        parts.append("not currently marked open-to-work")
 
-    if rank >= 80:
-        parts.append("included at tail of shortlist — marginal fit")
+    if rank >= 85:
+        parts.append("marginal fit — included at tail of shortlist")
 
     return "; ".join(parts) + "."
 
@@ -125,40 +141,36 @@ def generate_reasoning(feat: dict, rank: int) -> str:
 # Main ranking function
 # ---------------------------------------------------------------------------
 
-def rank_candidates(candidates_path: str, out_path: str, artifacts_dir: Path) -> None:
+def rank_candidates(candidates_path: str, out_path: str,
+                    artifacts_dir: Path) -> None:
     t0 = time.time()
-    print(f"[Parakh AI rank.py] Starting ranking step")
-    print(f"  Candidates: {candidates_path}")
-    print(f"  Artifacts:  {artifacts_dir}")
+    print("[Parakh AI] Starting ranking step")
 
     # ------------------------------------------------------------------
-    # Load pre-computed artifacts
+    # Load pre-computed structured features
     # ------------------------------------------------------------------
-    use_embeddings = (artifacts_dir / "embeddings.npy").exists()
-    use_features   = (artifacts_dir / "features.jsonl").exists()
+    feat_path  = artifacts_dir / "features.jsonl"
+    ids_path   = artifacts_dir / "candidate_ids.npy"
+    scores_path = artifacts_dir / "composite_scores.npy"
+    honey_path = artifacts_dir / "honeypot_flags.npy"
 
-    if not use_features:
-        # Fallback: recompute features on-the-fly (slower but still within 5 min for features-only)
-        print("  WARNING: features.jsonl not found. Recomputing on-the-fly.")
-        use_features = False
-
-    if use_features:
+    if feat_path.exists() and ids_path.exists():
         print("  Loading pre-computed features...")
-        ids = np.load(artifacts_dir / "candidate_ids.npy", allow_pickle=True)
-        scores = np.load(artifacts_dir / "composite_scores.npy")
-        honeypots = np.load(artifacts_dir / "honeypot_flags.npy")
+        ids       = np.load(ids_path, allow_pickle=True)
+        scores    = np.load(scores_path)
+        honeypots = np.load(honey_path)
 
-        # Load feature rows for reasoning (only top ~300 needed)
         feature_index = {}
-        with open(artifacts_dir / "features.jsonl", "r") as f:
+        with open(feat_path, "r", encoding="utf-8") as f:
             for line in f:
                 row = json.loads(line)
                 feature_index[row["candidate_id"]] = row
-        print(f"  Loaded {len(ids):,} candidates from pre-computed features")
+
+        print(f"  Loaded {len(ids):,} candidates from cache")
 
     else:
-        # Full recompute path (fallback)
-        print("  Recomputing features from scratch...")
+        # Fallback: recompute on-the-fly
+        print("  Cache not found — recomputing features...")
         candidates = []
         with open(candidates_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -172,61 +184,60 @@ def rank_candidates(candidates_path: str, out_path: str, artifacts_dir: Path) ->
             feat["composite_score"] = final_score(feat)
             feature_rows.append(feat)
 
-        ids = np.array([r["candidate_id"] for r in feature_rows])
-        scores = np.array([r["composite_score"] for r in feature_rows], dtype=np.float32)
+        ids       = np.array([r["candidate_id"] for r in feature_rows])
+        scores    = np.array([r["composite_score"] for r in feature_rows], dtype=np.float32)
         honeypots = np.array([r["is_honeypot"] for r in feature_rows], dtype=bool)
         feature_index = {r["candidate_id"]: r for r in feature_rows}
 
-    print(f"  Feature load: {time.time()-t0:.2f}s")
+    print(f"  Feature load time: {time.time()-t0:.2f}s")
 
     # ------------------------------------------------------------------
-    # Semantic similarity layer (if embeddings available)
+    # Semantic similarity layer
     # ------------------------------------------------------------------
+    emb_path = artifacts_dir / "embeddings.npy"
+    jd_path  = artifacts_dir / "jd_embedding.npy"
     semantic_scores = np.zeros(len(ids), dtype=np.float32)
 
-    if use_embeddings and (artifacts_dir / "jd_embedding.npy").exists():
+    if emb_path.exists() and jd_path.exists():
         print("  Loading embeddings for semantic fusion...")
         t_emb = time.time()
-        embeddings = np.load(artifacts_dir / "embeddings.npy")  # (N, 384)
-        jd_emb = np.load(artifacts_dir / "jd_embedding.npy")    # (1, 384)
+        embeddings = np.load(emb_path)          # (N, 384) float32
+        jd_emb     = np.load(jd_path)           # (1, 384) float32
 
-        # Cosine similarity via dot product (embeddings are L2-normalised)
-        semantic_scores = embeddings @ jd_emb.T       # (N, 1)
-        semantic_scores = semantic_scores.squeeze()   # (N,)
-        # Rescale from [-1,1] to [0,1]
-        semantic_scores = (semantic_scores + 1.0) / 2.0
-        print(f"  Semantic similarity computed: {time.time()-t_emb:.2f}s")
+        # Dot product = cosine similarity (both L2-normalised in precompute)
+        semantic_scores = (embeddings @ jd_emb.T).squeeze()
+        semantic_scores = (semantic_scores + 1.0) / 2.0  # rescale [-1,1] -> [0,1]
+        print(f"  Semantic similarity done in {time.time()-t_emb:.2f}s")
+        print(f"  Semantic score stats: mean={semantic_scores.mean():.3f} "
+              f"max={semantic_scores.max():.3f} min={semantic_scores.min():.3f}")
+        use_semantic = True
     else:
         print("  No embeddings found — using structured features only")
+        use_semantic = False
 
     # ------------------------------------------------------------------
     # Score fusion
     # ------------------------------------------------------------------
-    # Structured features carry 75% weight; semantic 25%
-    # This intentionally prevents pure keyword-embedding from dominating
-    STRUCT_W = 0.75
-    SEM_W = 0.25
-
-    if use_embeddings and semantic_scores.any():
+    if use_semantic:
         fused = STRUCT_W * scores + SEM_W * semantic_scores
     else:
-        fused = scores
+        fused = scores.copy()
 
-    # Force honeypots to bottom
+    # Honeypots go to absolute bottom — hard rule
     fused[honeypots] = 0.0
 
     # ------------------------------------------------------------------
     # Select top 100
     # ------------------------------------------------------------------
-    top_indices = np.argsort(fused)[::-1][:200]   # take 200, filter to 100
+    top_indices = np.argsort(fused)[::-1][:150]
 
     results = []
-    seen_ids = set()
+    seen = set()
     for idx in top_indices:
         cid = str(ids[idx])
-        if cid in seen_ids:
+        if cid in seen:
             continue
-        seen_ids.add(cid)
+        seen.add(cid)
         results.append({
             "candidate_id": cid,
             "score": float(fused[idx]),
@@ -235,29 +246,27 @@ def rank_candidates(candidates_path: str, out_path: str, artifacts_dir: Path) ->
         if len(results) == 100:
             break
 
-    # Ensure exactly 100 rows
-    if len(results) < 100:
-        print(f"  WARNING: only {len(results)} candidates above threshold")
-
     # ------------------------------------------------------------------
-    # Build submission CSV
+    # Build submission DataFrame
     # ------------------------------------------------------------------
     rows = []
     prev_score = None
     for rank_1based, r in enumerate(results, start=1):
         score = round(r["score"], 4)
-        # Enforce non-increasing scores (add tiny epsilon for tie-break)
         if prev_score is not None and score > prev_score:
             score = prev_score
         prev_score = score
 
-        reasoning = generate_reasoning(r["feat"], rank_1based) if r["feat"] else "Candidate ranked by composite signal score."
-
+        reasoning = (
+            generate_reasoning(r["feat"], rank_1based)
+            if r["feat"]
+            else "Ranked by composite signal score."
+        )
         rows.append({
             "candidate_id": r["candidate_id"],
-            "rank": rank_1based,
-            "score": score,
-            "reasoning": reasoning,
+            "rank":         rank_1based,
+            "score":        score,
+            "reasoning":    reasoning,
         })
 
     df = pd.DataFrame(rows, columns=["candidate_id", "rank", "score", "reasoning"])
@@ -266,20 +275,29 @@ def rank_candidates(candidates_path: str, out_path: str, artifacts_dir: Path) ->
     elapsed = time.time() - t0
     print(f"\n[Parakh AI] Ranking complete in {elapsed:.1f}s")
     print(f"  Output: {out_path}")
-    print(f"  Top 5 candidates:")
-    for _, row in df.head(5).iterrows():
-        print(f"    Rank {int(row['rank'])}: {row['candidate_id']} | score={row['score']:.4f}")
-        print(f"      {row['reasoning'][:90]}...")
+    print(f"\n  Top 10 candidates:")
+    for _, row in df.head(10).iterrows():
+        feat = feature_index.get(row["candidate_id"], {})
+        print(f"    #{int(row['rank']):>3} {row['candidate_id']} "
+              f"score={row['score']:.4f} | "
+              f"{feat.get('title','?')[:30]:<30} | "
+              f"{feat.get('yoe','?')}yr | "
+              f"{feat.get('location','?')[:20]}")
 
-    if elapsed > 290:
-        print("  WARNING: Approaching 5-minute limit. Consider using --skip-embeddings.")
+    if elapsed > 280:
+        print("\n  WARNING: Approaching 5-minute limit.")
+        print("  If embeddings are slow to load, run with --skip-embeddings flag.")
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Parakh AI — Ranking step (timed)")
+    parser = argparse.ArgumentParser(description="Parakh AI — Ranking (timed step)")
     parser.add_argument("--candidates", default="./candidates.jsonl")
-    parser.add_argument("--out", default="./submission.csv")
-    parser.add_argument("--artifacts", default="./artifacts")
+    parser.add_argument("--out",        default="./submission.csv")
+    parser.add_argument("--artifacts",  default="./artifacts")
     args = parser.parse_args()
 
     rank_candidates(

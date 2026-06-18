@@ -1,0 +1,42 @@
+team_name: "Parakh AI"
+team_id: "Parakh AI"
+participant_name: "Shaik Thaslim"
+institution: "Amrita Vishwa Vidyapeetham"
+track: "Track 1 - Data & AI Challenge: Intelligent Candidate Discovery"
+
+submission:
+  github_repo: "https://github.com/thaslimShaikh/parakh-ai"
+  output_file: "parakh_ai.csv"
+
+pipeline:
+  precompute_script: "precompute.py"
+  ranking_script: "rank.py"
+  features_module: "src/features.py"
+  embedding_model: "all-MiniLM-L6-v2"
+  ranking_step_runtime_seconds: 20
+  ranking_step_cpu_only: true
+  ranking_step_requires_network: false
+
+architecture:
+  stage_1_precompute:
+    - structured feature extraction (100K candidates)
+    - sentence-transformer embedding generation
+    - honeypot detection
+    - artifact caching to disk
+  stage_2_ranking:
+    - load cached features + embeddings
+    - structured score (title gate + career quality + skill trust + experience + location + education)
+    - semantic score (cosine similarity via dot product on normalised embeddings)
+    - behavioral modifier (multiplicative: recency + response rate + open-to-work + notice + github)
+    - fusion: 0.80 * structured + 0.20 * semantic
+    - honeypot suppression
+    - top-100 selection + reasoning string generation
+
+key_signals:
+  - title_gating: "Primary anti-keyword-stuffer defence — 28% weight"
+  - career_quality: "Product company vs consulting; retrieval/recsys work in descriptions — 22%"
+  - skill_trust: "Weighted by proficiency x endorsements x duration — 20%"
+  - experience_fit: "5-9yr JD sweet spot — 12%"
+  - location: "Pune/Noida preference — 8%"
+  - behavioral_modifier: "Multiplicative: recency, response rate, open-to-work, notice, GitHub"
+  - honeypot_detection: "43 candidates suppressed"
