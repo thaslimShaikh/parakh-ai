@@ -229,19 +229,25 @@ def rank_candidates(candidates_path: str, out_path: str,
     # ------------------------------------------------------------------
     # Select top 100
     # ------------------------------------------------------------------
-    top_indices = np.argsort(fused)[::-1][:150]
+    # Sort by score descending, then candidate_id ascending on ties
+    # (validator requirement: equal scores must be tie-broken by candidate_id asc)
+    top_indices = np.argsort(fused)[::-1][:300]
+    candidates_pool = [
+        (str(ids[i]), float(fused[i]), feature_index.get(str(ids[i]), {}))
+        for i in top_indices
+    ]
+    candidates_pool.sort(key=lambda x: (-x[1], x[0]))
 
     results = []
     seen = set()
-    for idx in top_indices:
-        cid = str(ids[idx])
+    for cid, score, feat in candidates_pool:
         if cid in seen:
             continue
         seen.add(cid)
         results.append({
             "candidate_id": cid,
-            "score": float(fused[idx]),
-            "feat": feature_index.get(cid, {}),
+            "score": score,
+            "feat": feat,
         })
         if len(results) == 100:
             break
@@ -250,12 +256,9 @@ def rank_candidates(candidates_path: str, out_path: str,
     # Build submission DataFrame
     # ------------------------------------------------------------------
     rows = []
-    prev_score = None
     for rank_1based, r in enumerate(results, start=1):
-        score = round(r["score"], 4)
-        if prev_score is not None and score > prev_score:
-            score = prev_score
-        prev_score = score
+        # Keep 6dp so tie-broken candidates retain distinct scores
+        score = round(r["score"], 6)
 
         reasoning = (
             generate_reasoning(r["feat"], rank_1based)
